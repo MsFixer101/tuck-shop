@@ -4,6 +4,7 @@ import { getKey } from './lib/key-store.js';
 import { safeFetch } from './lib/ssrf.js';
 import { renderPage, RenderBusyError } from './lib/render.js';
 import { extractContent, stripHtml } from './lib/extract.js';
+import { pdfToText } from './lib/pdf.js';
 import { execFile } from 'node:child_process';
 
 // YouTube transcripts: pure-Node caption fetch is dead (YouTube returns 200/empty
@@ -222,7 +223,24 @@ async function fetchUrl({ url, mode = 'text', render, offset = 0, max_chars } = 
     if (!fetched.res.ok) return { error: `Fetch failed: HTTP ${fetched.res.status}` };
     finalUrl = fetched.finalUrl;
     ctype = (fetched.res.headers.get('content-type') || '').toLowerCase();
-    if (ctype.includes('application/pdf') || (ctype && !/(text|html|json|xml)/.test(ctype))) {
+    if (ctype.includes('application/pdf')) {
+      const lenHdr = fetched.res.headers.get('content-length');
+      if (lenHdr && Number(lenHdr) > 20 * 1024 * 1024) {
+        return { result: { url: finalUrl, content_type: ctype, readable: false, note: `PDF too large (${Math.round(Number(lenHdr) / 1048576)}MB, 20MB cap).`, content: '' } };
+      }
+      const buf = Buffer.from(await fetched.res.arrayBuffer());
+      if (buf.length > 20 * 1024 * 1024) {
+        return { result: { url: finalUrl, content_type: ctype, readable: false, note: `PDF too large (${Math.round(buf.length / 1048576)}MB, 20MB cap).`, content: '' } };
+      }
+      const text = await pdfToText(buf);
+      if (!text) {
+        const hint = /arxiv\.org/i.test(finalUrl) ? ' Try the arxiv.org/abs/ or arxiv.org/html/ version.' : ' If this is a paper, fetch its HTML/abstract page instead of the PDF.';
+        return { result: { url: finalUrl, content_type: ctype, readable: false, note: `PDF text extraction failed.${hint}`, content: '' } };
+      }
+      const content = text.slice(off, off + maxChars);
+      return { result: { url: finalUrl, readable: true, content_type: 'application/pdf', chars: text.length, truncated: off + content.length < text.length, content, ...(off > 0 ? { offset: off } : {}) } };
+    }
+    if (ctype && !/(text|html|json|xml)/.test(ctype)) {
       const hint = /arxiv\.org/i.test(finalUrl) ? ' Try the arxiv.org/abs/ or arxiv.org/html/ version.' : ' If this is a paper, fetch its HTML/abstract page instead of the PDF.';
       return { result: { url: finalUrl, content_type: ctype || 'unknown', readable: false, note: `Non-text content (${ctype || 'binary'}) can't be read directly.${hint}`, content: '' } };
     }
@@ -346,7 +364,7 @@ async function convertCurrency({ amount = 1, from, to } = {}) {
 
 export const CAPABILITIES = {
   web_search: { description: 'Search the live web (SearXNG → Serper → Brave). Args: {query, limit?, recency?: day|week|month|year}.', args: { query: 'string', limit: 'number?', recency: 'day|week|month|year?' }, handler: webSearch },
-  fetch_url: { description: 'Fetch a URL as readable text (article-quality extraction, SSRF-safe, PDF-aware). Handles X/Twitter, YouTube, TikTok and (best-effort) Instagram via per-platform readers. JS-rendered SPAs are rendered automatically; pass render:true to force, render:false to disable. Long pages: re-fetch with offset to continue reading. Args: {url, mode?: text|links|both, render?: boolean, offset?: number, max_chars?: number}. arXiv PDFs auto-redirect to the abstract.', args: { url: 'string', mode: 'text|links|both?', render: 'boolean?', offset: 'number?', max_chars: 'number?' }, handler: fetchUrl },
+  fetch_url: { description: 'Fetch a URL as readable text (article-quality extraction, SSRF-safe, reads PDFs (≤20MB) as text). Handles X/Twitter, YouTube, TikTok and (best-effort) Instagram via per-platform readers. JS-rendered SPAs are rendered automatically; pass render:true to force, render:false to disable. Long pages: re-fetch with offset to continue reading. Args: {url, mode?: text|links|both, render?: boolean, offset?: number, max_chars?: number}. arXiv PDFs auto-redirect to the abstract.', args: { url: 'string', mode: 'text|links|both?', render: 'boolean?', offset: 'number?', max_chars: 'number?' }, handler: fetchUrl },
   search_papers: { description: 'Search academic papers across HF, arXiv, and Semantic Scholar. Args: {query, source?: hf|arxiv|ss|all, limit?}.', args: { query: 'string', source: 'hf|arxiv|ss|all?', limit: 'number?' }, handler: searchPapers },
   search_models: { description: 'Search Hugging Face models. Args: {query, limit?}.', args: { query: 'string', limit: 'number?' }, handler: (a) => hfSearch('models', a) },
   search_datasets: { description: 'Search Hugging Face datasets. Args: {query, limit?}.', args: { query: 'string', limit: 'number?' }, handler: (a) => hfSearch('datasets', a) },
