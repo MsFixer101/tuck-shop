@@ -3,6 +3,7 @@
 import { getKey } from './lib/key-store.js';
 import { safeFetch } from './lib/ssrf.js';
 import { renderPage, RenderBusyError } from './lib/render.js';
+import { extractContent, stripHtml } from './lib/extract.js';
 import { execFile } from 'node:child_process';
 
 // YouTube transcripts: pure-Node caption fetch is dead (YouTube returns 200/empty
@@ -78,15 +79,6 @@ function extractLinks(html, baseUrl) {
     out.push({ url: href, text: text.slice(0, 120) });
   }
   return out;
-}
-
-// Shared tag-strip for plain and rendered HTML.
-function stripHtml(raw) {
-  return raw
-    .replace(/<script[\s\S]*?<\/script>/gi, ' ').replace(/<style[\s\S]*?<\/style>/gi, ' ')
-    .replace(/<[^>]+>/g, ' ')
-    .replace(/&nbsp;/g, ' ').replace(/&amp;/g, '&').replace(/&lt;/g, '<').replace(/&gt;/g, '>')
-    .replace(/&#39;|&apos;/g, "'").replace(/&quot;/g, '"').replace(/\s+/g, ' ').trim();
 }
 
 // SPA shell signature: external script bundle, common root ids, framework attrs, noscript hint.
@@ -173,30 +165,46 @@ async function socialFetch(url) {
   return null;
 }
 
-// Build the result object from an HTML (or text) source, applying the 8000-char cap.
-function buildResult(finalUrl, rawHtml, mode) {
+// Build the result object from an HTML (or text) source, applying offset/max_chars paging.
+// chars is the FULL extracted text length; content is the sliced window.
+function buildResult(finalUrl, rawHtml, mode, { offset = 0, maxChars = 8000 } = {}) {
   const out = { url: finalUrl, readable: true };
   if (mode === 'links' || mode === 'both') out.links = extractLinks(rawHtml, finalUrl);
   if (mode !== 'links') {
-    const text = stripHtml(rawHtml);
-    const max = 8000;
-    out.chars = text.length; out.truncated = text.length > max; out.content = text.slice(0, max);
+    const { text, title, byline, meta } = extractContent(rawHtml, finalUrl);
+    const content = text.slice(offset, offset + maxChars);
+    out.chars = text.length;
+    out.truncated = offset + content.length < text.length;
+    out.content = content;
+    if (offset > 0) out.offset = offset;
+    if (title) out.title = title;
+    if (byline) out.byline = byline;
+    if (meta.og_description) out.og_description = meta.og_description;
+    if (meta.canonical) out.canonical = meta.canonical;
+    if (meta.site_name) out.site_name = meta.site_name;
   }
   return out;
 }
 
-async function fetchUrl({ url, mode = 'text', render } = {}) {
+async function fetchUrl({ url, mode = 'text', render, offset = 0, max_chars } = {}) {
   if (!url) return { error: 'url is required' };
   const social = await socialFetch(url);
   if (social) return { result: social };
   let target = url;
   if (/arxiv\.org\/pdf\//i.test(target)) target = target.replace('/pdf/', '/abs/').replace(/\.pdf$/i, '');
 
+  // Paging args: offset (min 0), max_chars (min 1, hard cap 20000, default 8000).
+  const off = Number.isFinite(offset) && offset >= 0 ? Math.floor(offset) : 0;
+  let maxChars = max_chars == null ? 8000 : max_chars;
+  if (!Number.isFinite(maxChars) || maxChars < 1) maxChars = 8000;
+  maxChars = Math.min(maxChars, 20000);
+  const pageOpts = { offset: off, maxChars };
+
   // render: true → skip plain fetch entirely.
   if (render === true) {
     try {
       const { html, finalUrl } = await renderPage(target, { budgetMs: 15000, userAgent: UA });
-      const out = buildResult(finalUrl, html, mode);
+      const out = buildResult(finalUrl, html, mode, pageOpts);
       out.rendered = true;
       return { result: out };
     } catch (err) {
@@ -223,7 +231,7 @@ async function fetchUrl({ url, mode = 'text', render } = {}) {
     return { error: `Fetch failed: ${err.message}` };
   }
 
-  const plain = buildResult(finalUrl, raw, mode);
+  const plain = buildResult(finalUrl, raw, mode, pageOpts);
 
   // render:false → plain only.
   if (render === false) return { result: plain };
@@ -235,7 +243,7 @@ async function fetchUrl({ url, mode = 'text', render } = {}) {
     if (looksLikeSpaShell(raw, strippedText)) {
       try {
         const r = await renderPage(target, { budgetMs: 12000, userAgent: UA });
-        const rendered = buildResult(r.finalUrl, r.html, mode);
+        const rendered = buildResult(r.finalUrl, r.html, mode, pageOpts);
         const plainLen = mode === 'links' ? (plain.links?.length || 0) : (plain.chars || 0);
         const renderedLen = mode === 'links' ? (rendered.links?.length || 0) : (rendered.chars || 0);
         if (renderedLen > plainLen) {
@@ -338,7 +346,7 @@ async function convertCurrency({ amount = 1, from, to } = {}) {
 
 export const CAPABILITIES = {
   web_search: { description: 'Search the live web (SearXNG → Serper → Brave). Args: {query, limit?, recency?: day|week|month|year}.', args: { query: 'string', limit: 'number?', recency: 'day|week|month|year?' }, handler: webSearch },
-  fetch_url: { description: 'Fetch a URL as readable text (SSRF-safe, PDF-aware). Handles X/Twitter, YouTube, TikTok and (best-effort) Instagram via per-platform readers. JS-rendered SPAs are rendered automatically; pass render:true to force, render:false to disable. Args: {url, mode?: text|links|both, render?: boolean}. arXiv PDFs auto-redirect to the abstract.', args: { url: 'string', mode: 'text|links|both?', render: 'boolean?' }, handler: fetchUrl },
+  fetch_url: { description: 'Fetch a URL as readable text (article-quality extraction, SSRF-safe, PDF-aware). Handles X/Twitter, YouTube, TikTok and (best-effort) Instagram via per-platform readers. JS-rendered SPAs are rendered automatically; pass render:true to force, render:false to disable. Long pages: re-fetch with offset to continue reading. Args: {url, mode?: text|links|both, render?: boolean, offset?: number, max_chars?: number}. arXiv PDFs auto-redirect to the abstract.', args: { url: 'string', mode: 'text|links|both?', render: 'boolean?', offset: 'number?', max_chars: 'number?' }, handler: fetchUrl },
   search_papers: { description: 'Search academic papers across HF, arXiv, and Semantic Scholar. Args: {query, source?: hf|arxiv|ss|all, limit?}.', args: { query: 'string', source: 'hf|arxiv|ss|all?', limit: 'number?' }, handler: searchPapers },
   search_models: { description: 'Search Hugging Face models. Args: {query, limit?}.', args: { query: 'string', limit: 'number?' }, handler: (a) => hfSearch('models', a) },
   search_datasets: { description: 'Search Hugging Face datasets. Args: {query, limit?}.', args: { query: 'string', limit: 'number?' }, handler: (a) => hfSearch('datasets', a) },
