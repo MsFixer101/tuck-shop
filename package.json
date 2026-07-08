@@ -7,5 +7,8 @@
   "scripts": {
     "start": "node index.js",
     "dev": "node --watch index.js"
+  },
+  "dependencies": {
+    "puppeteer-core": "24.40.0"
   }
 }

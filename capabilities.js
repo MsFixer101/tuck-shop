@@ -2,6 +2,7 @@
 // Generic, stateless tools shared across the ecosystem (web search, fetch, papers, FX).
 import { getKey } from './lib/key-store.js';
 import { safeFetch } from './lib/ssrf.js';
+import { renderPage, RenderBusyError } from './lib/render.js';
 import { execFile } from 'node:child_process';
 
 // YouTube transcripts: pure-Node caption fetch is dead (YouTube returns 200/empty
@@ -79,6 +80,27 @@ function extractLinks(html, baseUrl) {
   return out;
 }
 
+// Shared tag-strip for plain and rendered HTML.
+function stripHtml(raw) {
+  return raw
+    .replace(/<script[\s\S]*?<\/script>/gi, ' ').replace(/<style[\s\S]*?<\/style>/gi, ' ')
+    .replace(/<[^>]+>/g, ' ')
+    .replace(/&nbsp;/g, ' ').replace(/&amp;/g, '&').replace(/&lt;/g, '<').replace(/&gt;/g, '>')
+    .replace(/&#39;|&apos;/g, "'").replace(/&quot;/g, '"').replace(/\s+/g, ' ').trim();
+}
+
+// SPA shell signature: external script bundle, common root ids, framework attrs, noscript hint.
+function looksLikeSpaShell(rawHtml, strippedText) {
+  const thin = strippedText.length < 400 ||
+    (rawHtml.length > 5000 && strippedText.length / rawHtml.length < 0.015);
+  if (!thin) return false;
+  if (/<script\b[^>]*\bsrc\s*=/i.test(rawHtml)) return true;
+  if (/id\s*=\s*["']?(root|app|__next)["']/i.test(rawHtml)) return true;
+  if (/data-reactroot|ng-app/i.test(rawHtml)) return true;
+  if (/<noscript\b[^>]*>[\s\S]*?(javascript|enable)/i.test(rawHtml)) return true;
+  return false;
+}
+
 function youtubeTranscript(id) {
   return new Promise((resolve) => {
     const script = 'import sys\n' +
@@ -151,38 +173,89 @@ async function socialFetch(url) {
   return null;
 }
 
-async function fetchUrl({ url, mode = 'text' } = {}) {
+// Build the result object from an HTML (or text) source, applying the 8000-char cap.
+function buildResult(finalUrl, rawHtml, mode) {
+  const out = { url: finalUrl, readable: true };
+  if (mode === 'links' || mode === 'both') out.links = extractLinks(rawHtml, finalUrl);
+  if (mode !== 'links') {
+    const text = stripHtml(rawHtml);
+    const max = 8000;
+    out.chars = text.length; out.truncated = text.length > max; out.content = text.slice(0, max);
+  }
+  return out;
+}
+
+async function fetchUrl({ url, mode = 'text', render } = {}) {
   if (!url) return { error: 'url is required' };
   const social = await socialFetch(url);
   if (social) return { result: social };
   let target = url;
   if (/arxiv\.org\/pdf\//i.test(target)) target = target.replace('/pdf/', '/abs/').replace(/\.pdf$/i, '');
+
+  // render: true → skip plain fetch entirely.
+  if (render === true) {
+    try {
+      const { html, finalUrl } = await renderPage(target, { budgetMs: 15000, userAgent: UA });
+      const out = buildResult(finalUrl, html, mode);
+      out.rendered = true;
+      return { result: out };
+    } catch (err) {
+      return { error: `Render failed: ${err.message}` };
+    }
+  }
+
+  // Plain fetch (default and render:false paths).
+  let raw, finalUrl, ctype;
   try {
-    const { res, finalUrl } = await safeFetch(target, {
+    const fetched = await safeFetch(target, {
+      timeoutMs: 8000,
       headers: { 'User-Agent': UA, Accept: 'text/html,application/xhtml+xml,text/plain,application/json' },
     });
-    if (!res.ok) return { error: `Fetch failed: HTTP ${res.status}` };
-    const ctype = (res.headers.get('content-type') || '').toLowerCase();
+    if (!fetched.res.ok) return { error: `Fetch failed: HTTP ${fetched.res.status}` };
+    finalUrl = fetched.finalUrl;
+    ctype = (fetched.res.headers.get('content-type') || '').toLowerCase();
     if (ctype.includes('application/pdf') || (ctype && !/(text|html|json|xml)/.test(ctype))) {
       const hint = /arxiv\.org/i.test(finalUrl) ? ' Try the arxiv.org/abs/ or arxiv.org/html/ version.' : ' If this is a paper, fetch its HTML/abstract page instead of the PDF.';
       return { result: { url: finalUrl, content_type: ctype || 'unknown', readable: false, note: `Non-text content (${ctype || 'binary'}) can't be read directly.${hint}`, content: '' } };
     }
-    const raw = await res.text();
-    const out = { url: finalUrl, readable: true };
-    if (mode === 'links' || mode === 'both') out.links = extractLinks(raw, finalUrl);
-    if (mode !== 'links') {
-      const text = raw
-        .replace(/<script[\s\S]*?<\/script>/gi, ' ').replace(/<style[\s\S]*?<\/style>/gi, ' ')
-        .replace(/<[^>]+>/g, ' ')
-        .replace(/&nbsp;/g, ' ').replace(/&amp;/g, '&').replace(/&lt;/g, '<').replace(/&gt;/g, '>')
-        .replace(/&#39;|&apos;/g, "'").replace(/&quot;/g, '"').replace(/\s+/g, ' ').trim();
-      const max = 8000;
-      out.chars = text.length; out.truncated = text.length > max; out.content = text.slice(0, max);
-    }
-    return { result: out };
+    raw = await fetched.res.text();
   } catch (err) {
     return { error: `Fetch failed: ${err.message}` };
   }
+
+  const plain = buildResult(finalUrl, raw, mode);
+
+  // render:false → plain only.
+  if (render === false) return { result: plain };
+
+  // Default path: auto-render fallback heuristic.
+  const isHtml = /html|xml/.test(ctype) || ctype === '' || /<!doctype html|<html/i.test(raw);
+  if (isHtml) {
+    const strippedText = mode === 'links' ? '' : stripHtml(raw);
+    if (looksLikeSpaShell(raw, strippedText)) {
+      try {
+        const r = await renderPage(target, { budgetMs: 12000, userAgent: UA });
+        const rendered = buildResult(r.finalUrl, r.html, mode);
+        const plainLen = mode === 'links' ? (plain.links?.length || 0) : (plain.chars || 0);
+        const renderedLen = mode === 'links' ? (rendered.links?.length || 0) : (rendered.chars || 0);
+        if (renderedLen > plainLen) {
+          rendered.rendered = true;
+          return { result: rendered };
+        }
+        // Rendered but not better — keep plain, note the attempt.
+        plain.render_attempted = true;
+        plain.note = 'JS render produced no more text than static HTML; returning static HTML text.';
+        return { result: plain };
+      } catch (err) {
+        const reason = err instanceof RenderBusyError ? 'busy' : (err.message || 'unknown');
+        plain.render_attempted = true;
+        plain.note = `JS render failed (${reason}); returning static HTML text.`;
+        return { result: plain };
+      }
+    }
+  }
+
+  return { result: plain };
 }
 
 // ---- search_papers: multi-source (HF + arXiv + Semantic Scholar) ------------
@@ -265,7 +338,7 @@ async function convertCurrency({ amount = 1, from, to } = {}) {
 
 export const CAPABILITIES = {
   web_search: { description: 'Search the live web (SearXNG → Serper → Brave). Args: {query, limit?, recency?: day|week|month|year}.', args: { query: 'string', limit: 'number?', recency: 'day|week|month|year?' }, handler: webSearch },
-  fetch_url: { description: 'Fetch a URL as readable text (SSRF-safe, PDF-aware). Handles X/Twitter, YouTube, TikTok and (best-effort) Instagram via per-platform readers. Args: {url, mode?: text|links|both}. arXiv PDFs auto-redirect to the abstract.', args: { url: 'string', mode: 'text|links|both?' }, handler: fetchUrl },
+  fetch_url: { description: 'Fetch a URL as readable text (SSRF-safe, PDF-aware). Handles X/Twitter, YouTube, TikTok and (best-effort) Instagram via per-platform readers. JS-rendered SPAs are rendered automatically; pass render:true to force, render:false to disable. Args: {url, mode?: text|links|both, render?: boolean}. arXiv PDFs auto-redirect to the abstract.', args: { url: 'string', mode: 'text|links|both?', render: 'boolean?' }, handler: fetchUrl },
   search_papers: { description: 'Search academic papers across HF, arXiv, and Semantic Scholar. Args: {query, source?: hf|arxiv|ss|all, limit?}.', args: { query: 'string', source: 'hf|arxiv|ss|all?', limit: 'number?' }, handler: searchPapers },
   search_models: { description: 'Search Hugging Face models. Args: {query, limit?}.', args: { query: 'string', limit: 'number?' }, handler: (a) => hfSearch('models', a) },
   search_datasets: { description: 'Search Hugging Face datasets. Args: {query, limit?}.', args: { query: 'string', limit: 'number?' }, handler: (a) => hfSearch('datasets', a) },

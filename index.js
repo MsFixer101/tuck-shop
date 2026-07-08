@@ -3,6 +3,7 @@
 // Node http server. Contract: POST /tool/:name {args} → {result} | {error}.
 import http from 'node:http';
 import { CAPABILITIES } from './capabilities.js';
+import { closeBrowser } from './lib/render.js';
 
 const PORT = Number(process.env.PORT) || 3455;
 const HOST = process.env.HOST || '127.0.0.1'; // localhost-only
@@ -49,6 +50,12 @@ const server = http.createServer(async (req, res) => {
   }
 
   send(res, 404, { error: 'Not found' });
+});
+
+for (const sig of ['SIGTERM', 'SIGINT']) process.on(sig, async () => {
+  await closeBrowser().catch(() => {});
+  server.close(() => process.exit(0));
+  setTimeout(() => process.exit(0), 2000).unref();
 });
 
 server.listen(PORT, HOST, () => {
