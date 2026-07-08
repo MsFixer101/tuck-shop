@@ -5,6 +5,8 @@ import { safeFetch } from './lib/ssrf.js';
 import { renderPage, RenderBusyError } from './lib/render.js';
 import { extractContent, stripHtml } from './lib/extract.js';
 import { pdfToText } from './lib/pdf.js';
+import { platformFetch } from './lib/readers.js';
+import { TtlCache } from './lib/cache.js';
 import { execFile } from 'node:child_process';
 
 // YouTube transcripts: pure-Node caption fetch is dead (YouTube returns 200/empty
@@ -14,6 +16,8 @@ const PYTHON = process.env.PYTHON_PATH || '/opt/homebrew/bin/python3.11';
 
 const SEARXNG_URL = process.env.SEARXNG_URL || 'http://127.0.0.1:3465';
 const UA = 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36';
+
+const fetchCache = new TtlCache({ max: 100, ttlMs: 300000 });
 
 // ---- web_search: SearXNG (self-hosted) → Serper → Brave ---------------------
 async function webSearch({ query, limit = 5, recency } = {}) {
@@ -166,48 +170,175 @@ async function socialFetch(url) {
   return null;
 }
 
-// Build the result object from an HTML (or text) source, applying offset/max_chars paging.
-// chars is the FULL extracted text length; content is the sliced window.
-function buildResult(finalUrl, rawHtml, mode, { offset = 0, maxChars = 8000 } = {}) {
-  const out = { url: finalUrl, readable: true };
-  if (mode === 'links' || mode === 'both') out.links = extractLinks(rawHtml, finalUrl);
+// Build intermediate "material" from an HTML source — the un-paged full extraction.
+// materialize() turns this into the final paged result for any offset/maxChars.
+function buildPageMaterial(finalUrl, rawHtml, mode) {
+  const material = { kind: 'page', finalUrl };
+  if (mode === 'links' || mode === 'both') {
+    material.links = extractLinks(rawHtml, finalUrl);
+  }
   if (mode !== 'links') {
     const { text, title, byline, meta } = extractContent(rawHtml, finalUrl);
-    const content = text.slice(offset, offset + maxChars);
-    out.chars = text.length;
-    out.truncated = offset + content.length < text.length;
-    out.content = content;
-    if (offset > 0) out.offset = offset;
-    if (title) out.title = title;
-    if (byline) out.byline = byline;
-    if (meta.og_description) out.og_description = meta.og_description;
-    if (meta.canonical) out.canonical = meta.canonical;
-    if (meta.site_name) out.site_name = meta.site_name;
+    material.fullText = text;
+    if (title) material.title = title;
+    if (byline) material.byline = byline;
+    material.meta = meta;
   }
+  return material;
+}
+
+// Pure function: turn cached material into the final paged result.
+function materialize(material, mode, off, maxChars) {
+  if (material.kind === 'social') return material.result;
+  if (material.kind === 'platform') {
+    const result = material.result;
+    if (result.platform === 'github' && result.readme) {
+      const readme = result.readme;
+      const content = readme.slice(off, off + maxChars);
+      const { readme: _, ...rest } = result;
+      return {
+        ...rest,
+        content,
+        chars: readme.length,
+        truncated: off + content.length < readme.length,
+        ...(off > 0 ? { offset: off } : {}),
+      };
+    }
+    return result;
+  }
+  if (material.kind === 'pdf') {
+    const content = material.text.slice(off, off + maxChars);
+    return {
+      url: material.finalUrl,
+      readable: true,
+      content_type: 'application/pdf',
+      chars: material.text.length,
+      truncated: off + content.length < material.text.length,
+      content,
+      ...(off > 0 ? { offset: off } : {}),
+      ...(material.archived ? { archived: true, archive_url: material.archive_url, archive_date: material.archive_date } : {}),
+    };
+  }
+  // kind === 'page'
+  const out = { url: material.finalUrl, readable: true };
+  if (material.links !== undefined) out.links = material.links;
+  if (material.fullText !== undefined) {
+    const content = material.fullText.slice(off, off + maxChars);
+    out.chars = material.fullText.length;
+    out.truncated = off + content.length < material.fullText.length;
+    out.content = content;
+    if (off > 0) out.offset = off;
+    if (material.title) out.title = material.title;
+    if (material.byline) out.byline = material.byline;
+    if (material.meta) {
+      if (material.meta.og_description) out.og_description = material.meta.og_description;
+      if (material.meta.canonical) out.canonical = material.meta.canonical;
+      if (material.meta.site_name) out.site_name = material.meta.site_name;
+    }
+  }
+  if (material.rendered) out.rendered = true;
+  if (material.render_attempted) out.render_attempted = true;
+  if (material.note) out.note = material.note;
+  if (material.archived) out.archived = true;
+  if (material.archive_url) out.archive_url = material.archive_url;
+  if (material.archive_date) out.archive_date = material.archive_date;
   return out;
+}
+
+// Wayback fallback: for 403/404/410/451, try the Internet Archive.
+// Returns { result } on success, or null (caller returns original error).
+async function tryWayback(originalUrl, mode, off, maxChars, render) {
+  try {
+    const r = await fetch(`https://archive.org/wayback/available?url=${encodeURIComponent(originalUrl)}`, { signal: AbortSignal.timeout(6000) });
+    if (!r.ok) return null;
+    const j = await r.json();
+    const snap = j?.archived_snapshots?.closest;
+    if (!snap?.available) return null;
+    const snapUrl = snap.url.replace(/^http:\/\//, 'https://');
+
+    const fetched = await safeFetch(snapUrl, {
+      timeoutMs: 8000,
+      headers: { 'User-Agent': UA, Accept: 'text/html,application/xhtml+xml,text/plain,application/json' },
+    });
+    if (!fetched.res.ok) return null;
+    const ctype = (fetched.res.headers.get('content-type') || '').toLowerCase();
+
+    if (ctype.includes('application/pdf')) {
+      const buf = Buffer.from(await fetched.res.arrayBuffer());
+      if (buf.length > 20 * 1024 * 1024) return null;
+      const text = await pdfToText(buf);
+      if (!text) return null;
+      const material = { kind: 'pdf', finalUrl: fetched.finalUrl, text, archived: true, archive_url: snap.url, archive_date: snap.timestamp };
+      fetchCache.set(originalUrl + '|' + mode + '|' + (render === true), material);
+      return { result: materialize(material, mode, off, maxChars) };
+    }
+
+    if (ctype && !/(text|html|json|xml)/.test(ctype)) return null;
+
+    const raw = await fetched.res.text();
+    const material = buildPageMaterial(fetched.finalUrl, raw, mode);
+    material.archived = true;
+    material.archive_url = snap.url;
+    material.archive_date = snap.timestamp;
+    fetchCache.set(originalUrl + '|' + mode + '|' + (render === true), material);
+    return { result: materialize(material, mode, off, maxChars) };
+  } catch {
+    return null;
+  }
 }
 
 async function fetchUrl({ url, mode = 'text', render, offset = 0, max_chars } = {}) {
   if (!url) return { error: 'url is required' };
-  const social = await socialFetch(url);
-  if (social) return { result: social };
-  let target = url;
-  if (/arxiv\.org\/pdf\//i.test(target)) target = target.replace('/pdf/', '/abs/').replace(/\.pdf$/i, '');
 
   // Paging args: offset (min 0), max_chars (min 1, hard cap 20000, default 8000).
   const off = Number.isFinite(offset) && offset >= 0 ? Math.floor(offset) : 0;
   let maxChars = max_chars == null ? 8000 : max_chars;
   if (!Number.isFinite(maxChars) || maxChars < 1) maxChars = 8000;
   maxChars = Math.min(maxChars, 20000);
-  const pageOpts = { offset: off, maxChars };
+
+  const cacheKey = url + '|' + mode + '|' + (render === true);
+  const cached = fetchCache.get(cacheKey);
+  if (cached) return { result: materialize(cached, mode, off, maxChars) };
+
+  // Social readers (X/YouTube/TikTok/Instagram).
+  const social = await socialFetch(url);
+  if (social) {
+    if (social.readable !== false) fetchCache.set(cacheKey, { kind: 'social', result: social });
+    return { result: social };
+  }
+
+  // Platform readers (GitHub/Reddit/HN).
+  const plat = await platformFetch(url);
+  if (plat) {
+    if (plat.readable !== false) fetchCache.set(cacheKey, { kind: 'platform', result: plat });
+    if (plat.platform === 'github' && plat.readme) {
+      const content = plat.readme.slice(off, off + maxChars);
+      const { readme: _, ...rest } = plat;
+      return { result: { ...rest, content, chars: plat.readme.length, truncated: off + content.length < plat.readme.length, ...(off > 0 ? { offset: off } : {}) } };
+    }
+    return { result: plat };
+  }
+
+  let target = url;
+  if (/arxiv\.org\/pdf\//i.test(target)) target = target.replace('/pdf/', '/abs/').replace(/\.pdf$/i, '');
+
+  // www.reddit.com serves a JS bot-check shell; old.reddit.com serves real HTML.
+  try {
+    const ru = new URL(target);
+    if (ru.hostname === 'reddit.com' || ru.hostname === 'www.reddit.com' || ru.hostname === 'np.reddit.com') {
+      ru.hostname = 'old.reddit.com';
+      target = ru.toString();
+    }
+  } catch {}
 
   // render: true → skip plain fetch entirely.
   if (render === true) {
     try {
       const { html, finalUrl } = await renderPage(target, { budgetMs: 15000, userAgent: UA });
-      const out = buildResult(finalUrl, html, mode, pageOpts);
-      out.rendered = true;
-      return { result: out };
+      const material = buildPageMaterial(finalUrl, html, mode);
+      material.rendered = true;
+      fetchCache.set(cacheKey, material);
+      return { result: materialize(material, mode, off, maxChars) };
     } catch (err) {
       return { error: `Render failed: ${err.message}` };
     }
@@ -220,7 +351,14 @@ async function fetchUrl({ url, mode = 'text', render, offset = 0, max_chars } = 
       timeoutMs: 8000,
       headers: { 'User-Agent': UA, Accept: 'text/html,application/xhtml+xml,text/plain,application/json' },
     });
-    if (!fetched.res.ok) return { error: `Fetch failed: HTTP ${fetched.res.status}` };
+    if (!fetched.res.ok) {
+      // Wayback fallback for 403/404/410/451 (plain-fetch path only).
+      if (render !== true && [403, 404, 410, 451].includes(fetched.res.status)) {
+        const wayback = await tryWayback(url, mode, off, maxChars, render);
+        if (wayback) return wayback;
+      }
+      return { error: `Fetch failed: HTTP ${fetched.res.status}` };
+    }
     finalUrl = fetched.finalUrl;
     ctype = (fetched.res.headers.get('content-type') || '').toLowerCase();
     if (ctype.includes('application/pdf')) {
@@ -237,8 +375,9 @@ async function fetchUrl({ url, mode = 'text', render, offset = 0, max_chars } = 
         const hint = /arxiv\.org/i.test(finalUrl) ? ' Try the arxiv.org/abs/ or arxiv.org/html/ version.' : ' If this is a paper, fetch its HTML/abstract page instead of the PDF.';
         return { result: { url: finalUrl, content_type: ctype, readable: false, note: `PDF text extraction failed.${hint}`, content: '' } };
       }
-      const content = text.slice(off, off + maxChars);
-      return { result: { url: finalUrl, readable: true, content_type: 'application/pdf', chars: text.length, truncated: off + content.length < text.length, content, ...(off > 0 ? { offset: off } : {}) } };
+      const material = { kind: 'pdf', finalUrl, text };
+      fetchCache.set(cacheKey, material);
+      return { result: materialize(material, mode, off, maxChars) };
     }
     if (ctype && !/(text|html|json|xml)/.test(ctype)) {
       const hint = /arxiv\.org/i.test(finalUrl) ? ' Try the arxiv.org/abs/ or arxiv.org/html/ version.' : ' If this is a paper, fetch its HTML/abstract page instead of the PDF.';
@@ -249,10 +388,13 @@ async function fetchUrl({ url, mode = 'text', render, offset = 0, max_chars } = 
     return { error: `Fetch failed: ${err.message}` };
   }
 
-  const plain = buildResult(finalUrl, raw, mode, pageOpts);
+  const plainMaterial = buildPageMaterial(finalUrl, raw, mode);
 
   // render:false → plain only.
-  if (render === false) return { result: plain };
+  if (render === false) {
+    fetchCache.set(cacheKey, plainMaterial);
+    return { result: materialize(plainMaterial, mode, off, maxChars) };
+  }
 
   // Default path: auto-render fallback heuristic.
   const isHtml = /html|xml/.test(ctype) || ctype === '' || /<!doctype html|<html/i.test(raw);
@@ -261,27 +403,29 @@ async function fetchUrl({ url, mode = 'text', render, offset = 0, max_chars } = 
     if (looksLikeSpaShell(raw, strippedText)) {
       try {
         const r = await renderPage(target, { budgetMs: 12000, userAgent: UA });
-        const rendered = buildResult(r.finalUrl, r.html, mode, pageOpts);
-        const plainLen = mode === 'links' ? (plain.links?.length || 0) : (plain.chars || 0);
-        const renderedLen = mode === 'links' ? (rendered.links?.length || 0) : (rendered.chars || 0);
+        const renderedMaterial = buildPageMaterial(r.finalUrl, r.html, mode);
+        const plainLen = mode === 'links' ? (plainMaterial.links?.length || 0) : (plainMaterial.fullText?.length || 0);
+        const renderedLen = mode === 'links' ? (renderedMaterial.links?.length || 0) : (renderedMaterial.fullText?.length || 0);
         if (renderedLen > plainLen) {
-          rendered.rendered = true;
-          return { result: rendered };
+          renderedMaterial.rendered = true;
+          fetchCache.set(cacheKey, renderedMaterial);
+          return { result: materialize(renderedMaterial, mode, off, maxChars) };
         }
-        // Rendered but not better — keep plain, note the attempt.
-        plain.render_attempted = true;
-        plain.note = 'JS render produced no more text than static HTML; returning static HTML text.';
-        return { result: plain };
+        // Rendered but not better — keep plain, note the attempt. Do NOT cache.
+        plainMaterial.render_attempted = true;
+        plainMaterial.note = 'JS render produced no more text than static HTML; returning static HTML text.';
+        return { result: materialize(plainMaterial, mode, off, maxChars) };
       } catch (err) {
         const reason = err instanceof RenderBusyError ? 'busy' : (err.message || 'unknown');
-        plain.render_attempted = true;
-        plain.note = `JS render failed (${reason}); returning static HTML text.`;
-        return { result: plain };
+        plainMaterial.render_attempted = true;
+        plainMaterial.note = `JS render failed (${reason}); returning static HTML text.`;
+        return { result: materialize(plainMaterial, mode, off, maxChars) };
       }
     }
   }
 
-  return { result: plain };
+  fetchCache.set(cacheKey, plainMaterial);
+  return { result: materialize(plainMaterial, mode, off, maxChars) };
 }
 
 // ---- search_papers: multi-source (HF + arXiv + Semantic Scholar) ------------
@@ -364,7 +508,7 @@ async function convertCurrency({ amount = 1, from, to } = {}) {
 
 export const CAPABILITIES = {
   web_search: { description: 'Search the live web (SearXNG → Serper → Brave). Args: {query, limit?, recency?: day|week|month|year}.', args: { query: 'string', limit: 'number?', recency: 'day|week|month|year?' }, handler: webSearch },
-  fetch_url: { description: 'Fetch a URL as readable text (article-quality extraction, SSRF-safe, reads PDFs (≤20MB) as text). Handles X/Twitter, YouTube, TikTok and (best-effort) Instagram via per-platform readers. JS-rendered SPAs are rendered automatically; pass render:true to force, render:false to disable. Long pages: re-fetch with offset to continue reading. Args: {url, mode?: text|links|both, render?: boolean, offset?: number, max_chars?: number}. arXiv PDFs auto-redirect to the abstract.', args: { url: 'string', mode: 'text|links|both?', render: 'boolean?', offset: 'number?', max_chars: 'number?' }, handler: fetchUrl },
+  fetch_url: { description: 'Fetch a URL as readable text (article-quality extraction, SSRF-safe, reads PDFs (≤20MB) as text). Handles X/Twitter, YouTube, TikTok, (best-effort) Instagram, GitHub, Reddit and Hacker News via per-platform readers. JS-rendered SPAs are rendered automatically; pass render:true to force, render:false to disable. Long pages: re-fetch with offset to continue reading. Unreachable pages fall back to the Internet Archive when a snapshot exists. Args: {url, mode?: text|links|both, render?: boolean, offset?: number, max_chars?: number}. arXiv PDFs auto-redirect to the abstract.', args: { url: 'string', mode: 'text|links|both?', render: 'boolean?', offset: 'number?', max_chars: 'number?' }, handler: fetchUrl },
   search_papers: { description: 'Search academic papers across HF, arXiv, and Semantic Scholar. Args: {query, source?: hf|arxiv|ss|all, limit?}.', args: { query: 'string', source: 'hf|arxiv|ss|all?', limit: 'number?' }, handler: searchPapers },
   search_models: { description: 'Search Hugging Face models. Args: {query, limit?}.', args: { query: 'string', limit: 'number?' }, handler: (a) => hfSearch('models', a) },
   search_datasets: { description: 'Search Hugging Face datasets. Args: {query, limit?}.', args: { query: 'string', limit: 'number?' }, handler: (a) => hfSearch('datasets', a) },
