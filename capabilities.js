@@ -13,7 +13,7 @@ const SEARXNG_URL = process.env.SEARXNG_URL || 'http://127.0.0.1:3465';
 const UA = 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36';
 
 // ---- web_search: SearXNG (self-hosted) → Serper → Brave ---------------------
-async function webSearch({ query, limit = 5 } = {}) {
+async function webSearch({ query, limit = 5, recency } = {}) {
   if (!query) return { error: 'query is required' };
   const n = Math.min(Math.max(limit, 1), 10);
 
@@ -21,6 +21,7 @@ async function webSearch({ query, limit = 5 } = {}) {
     const u = new URL(`${SEARXNG_URL}/search`);
     u.searchParams.set('q', query); u.searchParams.set('format', 'json');
     u.searchParams.set('language', 'en'); u.searchParams.set('safesearch', '0');
+    if (recency) u.searchParams.set('time_range', recency); // day|week|month|year (SearXNG)
     const r = await fetch(u, { signal: AbortSignal.timeout(15000) });
     if (r.ok) {
       const j = await r.json();
@@ -263,7 +264,7 @@ async function convertCurrency({ amount = 1, from, to } = {}) {
 }
 
 export const CAPABILITIES = {
-  web_search: { description: 'Search the live web (SearXNG → Serper → Brave). Args: {query, limit?}.', args: { query: 'string', limit: 'number?' }, handler: webSearch },
+  web_search: { description: 'Search the live web (SearXNG → Serper → Brave). Args: {query, limit?, recency?: day|week|month|year}.', args: { query: 'string', limit: 'number?', recency: 'day|week|month|year?' }, handler: webSearch },
   fetch_url: { description: 'Fetch a URL as readable text (SSRF-safe, PDF-aware). Handles X/Twitter, YouTube, TikTok and (best-effort) Instagram via per-platform readers. Args: {url, mode?: text|links|both}. arXiv PDFs auto-redirect to the abstract.', args: { url: 'string', mode: 'text|links|both?' }, handler: fetchUrl },
   search_papers: { description: 'Search academic papers across HF, arXiv, and Semantic Scholar. Args: {query, source?: hf|arxiv|ss|all, limit?}.', args: { query: 'string', source: 'hf|arxiv|ss|all?', limit: 'number?' }, handler: searchPapers },
   search_models: { description: 'Search Hugging Face models. Args: {query, limit?}.', args: { query: 'string', limit: 'number?' }, handler: (a) => hfSearch('models', a) },
