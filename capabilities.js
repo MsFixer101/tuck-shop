@@ -2,6 +2,12 @@
 // Generic, stateless tools shared across the ecosystem (web search, fetch, papers, FX).
 import { getKey } from './lib/key-store.js';
 import { safeFetch } from './lib/ssrf.js';
+import { execFile } from 'node:child_process';
+
+// YouTube transcripts: pure-Node caption fetch is dead (YouTube returns 200/empty
+// to naive requests). The Python youtube-transcript-api keeps up with their
+// anti-scraping, so shell out to the already-installed lib via python3.11.
+const PYTHON = process.env.PYTHON_PATH || '/opt/homebrew/bin/python3.11';
 
 const SEARXNG_URL = process.env.SEARXNG_URL || 'http://127.0.0.1:3465';
 const UA = 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36';
@@ -72,6 +78,40 @@ function extractLinks(html, baseUrl) {
   return out;
 }
 
+function youtubeTranscript(id) {
+  return new Promise((resolve) => {
+    const script = 'import sys\n' +
+      'try:\n' +
+      '    from youtube_transcript_api import YouTubeTranscriptApi\n' +
+      '    t = YouTubeTranscriptApi().fetch(sys.argv[1])\n' +
+      '    sys.stdout.write(" ".join(s.text for s in t))\n' +
+      'except Exception as e:\n' +
+      '    sys.stderr.write("ERR:" + str(e))\n';
+    execFile(PYTHON, ['-c', script, id], { timeout: 20000, maxBuffer: 4 * 1024 * 1024 }, (err, stdout) => {
+      const out = (stdout || '').trim();
+      resolve(!err && out ? out.replace(/\s+/g, ' ') : null);
+    });
+  });
+}
+
+// YouTube: metadata via oEmbed (reliable), transcript via Python youtube-transcript-api.
+async function youtubeFetch(url) {
+  const id = (url.match(/(?:youtube\.com\/(?:watch\?v=|shorts\/|embed\/)|youtu\.be\/)([A-Za-z0-9_-]{11})/) || [])[1];
+  let meta = {};
+  try {
+    const r = await fetch(`https://www.youtube.com/oembed?url=${encodeURIComponent(url)}&format=json`, { signal: AbortSignal.timeout(10000) });
+    if (r.ok) { const j = await r.json(); meta = { title: j.title, author: j.author_name }; }
+  } catch {}
+  const transcript = id ? await youtubeTranscript(id) : null;
+  if (!meta.title && !transcript) return { platform: 'youtube', url, readable: false, note: 'Could not fetch this video.' };
+  return {
+    platform: 'youtube', url, readable: true, ...meta,
+    transcript_available: !!transcript,
+    transcript: transcript ? transcript.slice(0, 12000) : null,
+    ...(transcript ? {} : { note: 'Metadata only — no transcript available for this video.' }),
+  };
+}
+
 // Social links are JS/login-walled; use per-platform readers instead of scraping.
 async function socialFetch(url) {
   const tw = url.match(/(?:twitter\.com|x\.com)\/([^/]+)\/status\/(\d+)/i);
@@ -82,12 +122,8 @@ async function socialFetch(url) {
     } catch {}
     return { platform: 'x', url, readable: false, note: 'Could not fetch this tweet.' };
   }
-  if (/(?:youtube\.com\/watch|youtu\.be\/|youtube\.com\/shorts\/)/i.test(url)) {
-    try {
-      const r = await fetch(`https://www.youtube.com/oembed?url=${encodeURIComponent(url)}&format=json`, { signal: AbortSignal.timeout(10000) });
-      if (r.ok) { const j = await r.json(); return { platform: 'youtube', url, readable: true, title: j.title, author: j.author_name, author_url: j.author_url, thumbnail: j.thumbnail_url }; }
-    } catch {}
-    return { platform: 'youtube', url, readable: false, note: 'Could not fetch this video.' };
+  if (/(?:youtube\.com\/(?:watch|shorts|embed)|youtu\.be\/)/i.test(url)) {
+    return youtubeFetch(url);
   }
   if (/tiktok\.com\//i.test(url)) {
     try {
