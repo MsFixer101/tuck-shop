@@ -8,6 +8,7 @@ import { pdfToText } from './lib/pdf.js';
 import { platformFetch } from './lib/readers.js';
 import { TtlCache } from './lib/cache.js';
 import { execFile } from 'node:child_process';
+import { cognitiveCapabilities } from './cognitive.js';
 
 // YouTube transcripts: pure-Node caption fetch is dead (YouTube returns 200/empty
 // to naive requests). The Python youtube-transcript-api keeps up with their
@@ -513,4 +514,7 @@ export const CAPABILITIES = {
   search_models: { description: 'Search Hugging Face models. Args: {query, limit?}.', args: { query: 'string', limit: 'number?' }, handler: (a) => hfSearch('models', a) },
   search_datasets: { description: 'Search Hugging Face datasets. Args: {query, limit?}.', args: { query: 'string', limit: 'number?' }, handler: (a) => hfSearch('datasets', a) },
   convert_currency: { description: 'Convert an amount between currencies at live rates. Args: {amount, from, to}.', args: { amount: 'number', from: 'string', to: 'string' }, handler: convertCurrency },
+  // Cognitive tools bridged from Train Tracks (calculator, datetime, probability,
+  // statistics, thesaurus, units). Empty {} if the TT package is unavailable.
+  ...cognitiveCapabilities,
 };
