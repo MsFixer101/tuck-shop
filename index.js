@@ -32,7 +32,10 @@ const server = http.createServer(async (req, res) => {
   }
 
   if (req.method === 'GET' && path === '/tools') {
-    return send(res, 200, Object.entries(CAPABILITIES).map(([name, c]) => ({ name, description: c.description, args: c.args })));
+    return send(res, 200, Object.entries(CAPABILITIES).map(([name, c]) => (
+      c.schema ? { name, description: c.description, args: c.args, schema: c.schema }
+               : { name, description: c.description, args: c.args }
+    )));
   }
 
   if (req.method === 'POST' && path.startsWith('/tool/')) {
