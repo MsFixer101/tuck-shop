@@ -16,3 +16,6 @@ Commit 3871a26 (pushed to `trunk`):
 Flip: `gh repo edit --visibility public`. Verified: `gh repo view` → PUBLIC / MIT; anonymous raw README fetch → HTTP 200.
 
 Service :3455 not restarted (healthy, 40 tools, before and after).
+
+## Follow-up: the blog page
+The point of going public was the "View on GitHub" button on the blog's Tuck Shop page (`localhost:8901/tuck-shop`, already linking `github.com/MsFixer101/tuck-shop`) — it 404'd for visitors while private. Added a README "Run it yourself" section (every env var + default) so a visitor can actually run it. Verified by cloning the public repo fresh, `npm install`, `PORT=3499 node index.js` → 6 core tools, live `convert_currency` and `fetch_url` results. Real service :3455 untouched (PID 1568, 13d uptime).
