@@ -25,6 +25,25 @@ The ecosystem's shared **capability counter**. Apps pop round to grab a generic 
 ## Security
 `fetch_url` is the whole ecosystem's fetch proxy, so `lib/ssrf.js` resolves the hostname to IPs and refuses private/reserved ranges (loopback, RFC-1918, link-local/metadata, CGNAT/Tailscale, IPv6 ULA), and **re-validates on every redirect hop**. Known-good backend hosts (SearXNG, Serper, etc.) use plain `fetch`; only user/model-supplied URLs go through `safeFetch`.
 
+## Run it yourself
+```sh
+npm install
+npm start          # http://127.0.0.1:3455
+curl localhost:3455/health
+```
+Everything is env-configurable; the defaults are this machine's paths.
+
+| env var | default | needed for |
+|---|---|---|
+| `PORT` / `HOST` | `3455` / `127.0.0.1` | — |
+| `SEARXNG_URL` | `http://127.0.0.1:3465` | `web_search` primary. Without it, search falls through to Serper/Brave (keys below). |
+| `SERPER_API_KEY`, `BRAVE_API_KEY` | — | search fallbacks (optional) |
+| `SEMANTICSCHOLAR_API_KEY`, `GITHUB_API_KEY` | — | higher rate limits only (optional) |
+| `CHROME_PATH` | puppeteer's chrome-headless-shell | JS rendering of SPAs; without it fetch degrades to plain HTML |
+| `PDFTOTEXT_PATH` / `PYTHON_PATH` | Homebrew paths | PDF reading, YouTube transcripts (`youtube-transcript-api`) |
+| `VECTOR_HUB_URL` / `HUB_TOKEN` | `localhost:3450` | my key vault — ignore it; env keys work without it |
+| `TT_TOOLS_PATH` | — | the 34 optional cognitive tools (see above) |
+
 ## Consuming it (from another app)
 ```js
 async function callCapability(name, args) {
