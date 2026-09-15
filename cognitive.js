@@ -13,6 +13,7 @@
 import { createRequire } from 'node:module';
 
 const TT_TOOLS_PATH =
+  process.env.TT_TOOLS_PATH ||
   '/Users/christina/panel-of-experts/training-tools/train-tracks/tools/index.js';
 
 // Turn a JSON-Schema property type + required-ness into the tuck-shop hint
