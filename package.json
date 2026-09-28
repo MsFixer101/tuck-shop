@@ -10,6 +10,7 @@
     "dev": "node --watch index.js"
   },
   "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.27.1",
     "@mozilla/readability": "^0.6.0",
     "linkedom": "^0.18.13",
     "puppeteer-core": "24.40.0"
