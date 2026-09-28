@@ -56,5 +56,11 @@ async function callCapability(name, args) {
 ```
 If Tuck Shop is down, `callCapability` should return `{ error }` fast (short timeout) so the caller degrades cleanly.
 
+### As an MCP server
+`mcp.js` is a stdio MCP bridge that exposes every tool to MCP clients (Grok CLI, Codex, Claude Code, …) by proxying to the running service; set `TUCK_SHOP_URL` if it isn't on `127.0.0.1:3455`.
+```sh
+grok mcp add tuckshop node -- /path/to/tuck-shop/mcp.js
+```
+
 ## Consumer contract
 The `fetch_url` result fields `content`, `readable`, `platform`, `url`, `chars`, `truncated` are frozen — consumers flatten on them. New fields are additive only.
