@@ -100,7 +100,7 @@ test('before: the page date first, the archive only when the page has none; the 
     { title: `T${e}`, url: U(e), snippet: `S${e}`, date: '2025-01-05', date_source: 'page publish date' },
   ]);
   assert.deepEqual(r.filter, { before: '2026-08-18', exclude: [`example.org/${d}`], excluded: 1,
-    method: "each page's publish date, else its first archived copy (Internet Archive)", checked: 4, outside_range: 1, no_date: 1, not_checked: 0 });
+    method: "each page's publish date, else its first archived copy (Internet Archive)", checked: 4, outside_range: 1, no_date: 1, not_checked: 0, more_in_range: 0 });
   assert.equal(archiveCalls(calls), 2, 'archive asked only for the two pages without a date of their own');
 });
 
@@ -130,6 +130,8 @@ test('stops looking once the top results already give enough, keeping them in or
   const looked = calls.filter((c) => c.url.startsWith('page:')).length;
   assert.equal(out.result.filter.checked, looked);
   assert.ok(looked < 20, `looked at ${looked} of 20`);
+  const f = out.result.filter;   // every result looked at is accounted for
+  assert.equal(out.result.results.length + f.outside_range + f.no_date + f.not_checked + f.more_in_range, f.checked);
 });
 
 test(`the archive is rationed: at most ${ARCHIVE_PER_MIN} lookups a minute, the rest "not checked"`, async () => {

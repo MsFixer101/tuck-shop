@@ -18,3 +18,9 @@ return what could have been found before the post's date, with the post itself l
   only SearXNG used before, now reaches them too.
 - `lib/search-dates.js`, `test/web-search.test.mjs` (12 tests, `npm test`; three deliberate bugs each caught). Real
   searches on a second copy (port 3557): 5 of 5 results dated before 18 Aug 2026, 3–8 s.
+
+## Live check after restart (k-0660)
+- Christina restarted Tuck Shop. `/tools` shows web_search with before/after/exclude.
+- Live dated search ("pain scale design patient experience", limit 5, before 2026-08-18, exclude christinasouch.com): 6.7 s, 5 of 5 results dated before 18 Aug (3 by page publish date, 2 by first archived copy); checked 15, outside 1, no date 2.
+- Undated search: same shape as before (query, source, results), no filter block, 0.5 s.
+- Follow-up: the filter block now also counts `more_in_range` (in range but past the limit, checked in parallel and not needed), so the counts add up to `checked`. README: a dated search can take up to ~15 s, so callers should give it a 20 s timeout.

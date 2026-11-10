@@ -55,6 +55,7 @@ async function callCapability(name, args) {
 }
 ```
 If Tuck Shop is down, `callCapability` should return `{ error }` fast (short timeout) so the caller degrades cleanly.
+A `web_search` with `before`/`after` checks each result's date and can take up to ~15 s: give that call a longer timeout (20 s).
 
 ### As an MCP server
 `mcp.js` is a stdio MCP bridge that exposes every tool to MCP clients (Grok CLI, Codex, Claude Code, …) by proxying to the running service; set `TUCK_SHOP_URL` if it isn't on `127.0.0.1:3455`.
