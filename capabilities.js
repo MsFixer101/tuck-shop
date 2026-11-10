@@ -9,6 +9,7 @@ import { platformFetch } from './lib/readers.js';
 import { TtlCache } from './lib/cache.js';
 import { execFile } from 'node:child_process';
 import { cognitiveCapabilities } from './cognitive.js';
+import { parseDay, serperTbs, braveFreshness, normalizeExclude, isExcluded, keepByDate } from './lib/search-dates.js';
 
 // YouTube transcripts: pure-Node caption fetch is dead (YouTube returns 200/empty
 // to naive requests). The Python youtube-transcript-api keeps up with their
@@ -21,9 +22,21 @@ const UA = 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (
 const fetchCache = new TtlCache({ max: 100, ttlMs: 300000 });
 
 // ---- web_search: SearXNG (self-hosted) → Serper → Brave ---------------------
-async function webSearch({ query, limit = 5, recency } = {}) {
+// before / after (YYYY-MM-DD) and exclude (URL substrings) are optional and additive (k-0660): see
+// lib/search-dates.js. Without them every provider call and every returned field is as it was.
+async function webSearch({ query, limit = 5, recency, before, after, exclude } = {}) {
   if (!query) return { error: 'query is required' };
   const n = Math.min(Math.max(limit, 1), 10);
+  let range;
+  try { range = { before: parseDay(before, 'before'), after: parseDay(after, 'after') }; } catch (e) { return { error: e.message }; }
+  if (range.before && range.after && !(range.after < range.before)) return { error: 'after must be earlier than before' };
+  const dated = !!(range.before || range.after);
+  const ex = normalizeExclude(exclude);
+  const limited = dated || ex.length > 0;
+  // What this search was limited by, echoed back with counts (only when it was limited).
+  const filterBase = () => ({ ...(range.before ? { before: range.before } : {}), ...(range.after ? { after: range.after } : {}), ...(ex.length ? { exclude: ex } : {}) });
+  const dropExcluded = (rs) => { const kept = rs.filter((r) => !isExcluded(r.url, ex)); return { kept, excluded: rs.length - kept.length }; };
+  let emptyDated = null;
 
   try {
     const u = new URL(`${SEARXNG_URL}/search`);
@@ -33,23 +46,42 @@ async function webSearch({ query, limit = 5, recency } = {}) {
     const r = await fetch(u, { signal: AbortSignal.timeout(15000) });
     if (r.ok) {
       const j = await r.json();
-      const results = (j.results || []).slice(0, n).map(x => ({ title: x.title || 'Untitled', url: x.url, snippet: x.content || '' }));
-      if (results.length) return { result: { query, source: 'searxng', results } };
+      const all = (j.results || []).map(x => ({ title: x.title || 'Untitled', url: x.url, snippet: x.content || '' }));
+      if (!limited) {
+        const results = all.slice(0, n);
+        if (results.length) return { result: { query, source: 'searxng', results } };
+      } else {
+        const { kept, excluded } = dropExcluded(all);
+        if (!dated) {
+          if (kept.length) return { result: { query, source: 'searxng', results: kept.slice(0, n), filter: { ...filterBase(), excluded } } };
+        } else if (kept.length) {
+          // SearXNG can't take a date range: check each result's date instead (lib/search-dates.js).
+          const v = await keepByDate(kept.slice(0, 20), { ...range, limit: n });
+          const filter = { ...filterBase(), excluded, method: "each page's publish date, else its first archived copy (Internet Archive)",
+            checked: v.checked, outside_range: v.outside_range, no_date: v.no_date, not_checked: v.not_checked };
+          if (v.kept.length) return { result: { query, source: 'searxng', results: v.kept, filter } };
+          emptyDated = { query, source: 'searxng', results: [], filter,
+            note: `No result could be shown to have existed ${range.before ? `before ${range.before}` : ''}${range.before && range.after ? ' and ' : ''}${range.after ? `on or after ${range.after}` : ''}.` };
+        }
+      }
     }
   } catch (e) { console.warn('[web_search] searxng:', e.message); }
 
   const serper = await getKey('serper');
   if (serper) {
     try {
+      const tbs = serperTbs({ ...range, recency });
       const r = await fetch('https://google.serper.dev/search', {
         method: 'POST', signal: AbortSignal.timeout(10000),
         headers: { 'X-API-KEY': serper, 'Content-Type': 'application/json' },
-        body: JSON.stringify({ q: query, num: n }),
+        body: JSON.stringify({ q: query, num: limited ? Math.min(n * 2, 20) : n, ...(tbs ? { tbs } : {}) }),
       });
       if (r.ok) {
         const j = await r.json();
-        const results = (j.organic || []).slice(0, n).map(x => ({ title: x.title || 'Untitled', url: x.link, snippet: x.snippet || '' }));
-        if (results.length) return { result: { query, source: 'serper', results } };
+        const all = (j.organic || []).map(x => ({ title: x.title || 'Untitled', url: x.link, snippet: x.snippet || '', ...(limited && x.date ? { date: x.date } : {}) }));
+        const { kept, excluded } = limited ? dropExcluded(all) : { kept: all, excluded: 0 };
+        const results = kept.slice(0, n);
+        if (results.length) return { result: { query, source: 'serper', results, ...(limited ? { filter: { ...filterBase(), excluded, ...(dated ? { method: 'search engine date range (Serper)' } : {}) } } : {}) } };
       }
     } catch (e) { console.warn('[web_search] serper:', e.message); }
   }
@@ -58,17 +90,22 @@ async function webSearch({ query, limit = 5, recency } = {}) {
   if (brave) {
     try {
       const u = new URL('https://api.search.brave.com/res/v1/web/search');
-      u.searchParams.set('q', query); u.searchParams.set('count', String(n));
+      u.searchParams.set('q', query); u.searchParams.set('count', String(limited ? Math.min(n * 2, 20) : n));
+      const freshness = braveFreshness({ ...range, recency });
+      if (freshness) u.searchParams.set('freshness', freshness);
       const r = await fetch(u, { headers: { Accept: 'application/json', 'X-Subscription-Token': brave }, signal: AbortSignal.timeout(10000) });
       if (r.ok) {
         const j = await r.json();
-        const results = (j.web?.results || []).slice(0, n).map(x => ({ title: x.title || 'Untitled', url: x.url, snippet: x.description || '' }));
-        if (results.length) return { result: { query, source: 'brave', results } };
+        const all = (j.web?.results || []).map(x => ({ title: x.title || 'Untitled', url: x.url, snippet: x.description || '', ...(limited && x.page_age ? { date: String(x.page_age).slice(0, 10) } : {}) }));
+        const { kept, excluded } = limited ? dropExcluded(all) : { kept: all, excluded: 0 };
+        const results = kept.slice(0, n);
+        if (results.length) return { result: { query, source: 'brave', results, ...(limited ? { filter: { ...filterBase(), excluded, ...(dated ? { method: 'search engine date range (Brave)' } : {}) } } : {}) } };
       }
     } catch (e) { console.warn('[web_search] brave:', e.message); }
   }
 
-  return { result: { query, source: 'none', results: [], note: 'All search providers returned nothing.' } };
+  if (emptyDated) return { result: emptyDated };
+  return { result: { query, source: 'none', results: [], note: 'All search providers returned nothing.', ...(limited ? { filter: filterBase() } : {}) } };
 }
 
 // ---- fetch_url: SSRF-safe, PDF-aware, optional link extraction --------------
@@ -508,7 +545,7 @@ async function convertCurrency({ amount = 1, from, to } = {}) {
 }
 
 export const CAPABILITIES = {
-  web_search: { description: 'Search the live web (SearXNG → Serper → Brave). Args: {query, limit?, recency?: day|week|month|year}.', args: { query: 'string', limit: 'number?', recency: 'day|week|month|year?' }, handler: webSearch },
+  web_search: { description: 'Search the live web (SearXNG → Serper → Brave). Args: {query, limit?, recency?: day|week|month|year, before?: YYYY-MM-DD (only pages that existed before that day), after?: YYYY-MM-DD (only pages first seen on or after it), exclude?: [URL parts to leave out]}. A dated search returns a filter block saying how the dates were checked and what was left out.', args: { query: 'string', limit: 'number?', recency: 'day|week|month|year?', before: 'YYYY-MM-DD?', after: 'YYYY-MM-DD?', exclude: 'string[]?' }, handler: webSearch },
   fetch_url: { description: 'Fetch a URL as readable text (article-quality extraction, SSRF-safe, reads PDFs (≤20MB) as text). Handles X/Twitter, YouTube, TikTok, (best-effort) Instagram, GitHub, Reddit and Hacker News via per-platform readers. JS-rendered SPAs are rendered automatically; pass render:true to force, render:false to disable. Long pages: re-fetch with offset to continue reading. Unreachable pages fall back to the Internet Archive when a snapshot exists. Args: {url, mode?: text|links|both, render?: boolean, offset?: number, max_chars?: number}. arXiv PDFs auto-redirect to the abstract.', args: { url: 'string', mode: 'text|links|both?', render: 'boolean?', offset: 'number?', max_chars: 'number?' }, handler: fetchUrl },
   search_papers: { description: 'Search academic papers across HF, arXiv, and Semantic Scholar. Args: {query, source?: hf|arxiv|ss|all, limit?}.', args: { query: 'string', source: 'hf|arxiv|ss|all?', limit: 'number?' }, handler: searchPapers },
   search_models: { description: 'Search Hugging Face models. Args: {query, limit?}.', args: { query: 'string', limit: 'number?' }, handler: (a) => hfSearch('models', a) },

@@ -13,7 +13,7 @@ The ecosystem's shared **capability counter**. Apps pop round to grab a generic 
 ## Capabilities
 | tool | what it does |
 |---|---|
-| `web_search` | SearXNG → Serper → Brave. `{query, limit?}` |
+| `web_search` | SearXNG → Serper → Brave. `{query, limit?, recency?, before?, after?, exclude?}`: `before`/`after` (YYYY-MM-DD) keep only pages from before / on or after a date (Serper and Brave filter in the query; a SearXNG result is checked by its own publish date, else its first Internet Archive copy, rationed to 10 lookups a minute), `exclude` drops URLs containing any of the given strings. A limited search returns a `filter` block saying how and what was left out. |
 | `fetch_url` | SSRF-safe, PDF-aware readable fetch (Readability extraction). Per-platform readers for X/Twitter, YouTube, TikTok, Instagram (best-effort), GitHub, Reddit, Hacker News; JS-rendered SPAs rendered automatically via headless Chrome; Wayback fallback on 403/404/410/451; 5-min result cache; arXiv PDFs auto-redirect to the abstract. `{url, mode?: text\|links\|both, render?, offset?, max_chars?}` |
 | `search_papers` | Multi-source: HF + arXiv + Semantic Scholar (merged, de-duped). `{query, source?, limit?}` |
 | `search_models` / `search_datasets` | Hugging Face. `{query, limit?}` |
