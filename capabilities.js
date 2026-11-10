@@ -58,7 +58,7 @@ async function webSearch({ query, limit = 5, recency, before, after, exclude } =
           // SearXNG can't take a date range: check each result's date instead (lib/search-dates.js).
           const v = await keepByDate(kept.slice(0, 20), { ...range, limit: n });
           const filter = { ...filterBase(), excluded, method: "each page's publish date, else its first archived copy (Internet Archive)",
-            checked: v.checked, outside_range: v.outside_range, no_date: v.no_date, not_checked: v.not_checked };
+            checked: v.checked, outside_range: v.outside_range, no_date: v.no_date, not_checked: v.not_checked, more_in_range: v.more_in_range };
           if (v.kept.length) return { result: { query, source: 'searxng', results: v.kept, filter } };
           emptyDated = { query, source: 'searxng', results: [], filter,
             note: `No result could be shown to have existed ${range.before ? `before ${range.before}` : ''}${range.before && range.after ? ' and ' : ''}${range.after ? `on or after ${range.after}` : ''}.` };
