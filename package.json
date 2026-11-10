@@ -1,7 +1,7 @@
 {
   "name": "tuck-shop",
   "version": "1.0.0",
-  "description": "Shared capability service for the exocortex ecosystem \u2014 web search, fetch, papers, FX.",
+  "description": "Shared capability service for the exocortex ecosystem — web search, fetch, papers, FX.",
   "license": "MIT",
   "type": "module",
   "main": "index.js",
