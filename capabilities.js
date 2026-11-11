@@ -9,7 +9,7 @@ import { platformFetch } from './lib/readers.js';
 import { TtlCache } from './lib/cache.js';
 import { execFile } from 'node:child_process';
 import { cognitiveCapabilities } from './cognitive.js';
-import { parseDay, serperTbs, braveFreshness, normalizeExclude, isExcluded, keepByDate } from './lib/search-dates.js';
+import { parseDay, serperTbs, braveFreshness, normalizeExclude, isExcluded, keepByDate, publishedDateFromHtml, waybackFirstSeen } from './lib/search-dates.js';
 
 // YouTube transcripts: pure-Node caption fetch is dead (YouTube returns 200/empty
 // to naive requests). The Python youtube-transcript-api keeps up with their
@@ -222,7 +222,16 @@ function buildPageMaterial(finalUrl, rawHtml, mode) {
     if (byline) material.byline = byline;
     material.meta = meta;
   }
+  // The date the page states about itself (meta tags, then JSON-LD), as web_search's dated filter reads it.
+  // Additive (k-0657): only present when the page states one.
+  const published = publishedDateFromHtml(rawHtml || '');
+  if (published) material.published = published;
   return material;
+}
+
+/** Tests only: what fetch_url returns for this HTML, without fetching it. */
+export function __pageResult(finalUrl, rawHtml, mode = 'text', off = 0, maxChars = 8000) {
+  return materialize(buildPageMaterial(finalUrl, rawHtml, mode), mode, off, maxChars);
 }
 
 // Pure function: turn cached material into the final paged result.
@@ -274,6 +283,7 @@ function materialize(material, mode, off, maxChars) {
       if (material.meta.site_name) out.site_name = material.meta.site_name;
     }
   }
+  if (material.published) out.published = material.published;
   if (material.rendered) out.rendered = true;
   if (material.render_attempted) out.render_attempted = true;
   if (material.note) out.note = material.note;
@@ -325,7 +335,55 @@ async function tryWayback(originalUrl, mode, off, maxChars, render) {
   }
 }
 
-async function fetchUrl({ url, mode = 'text', render, offset = 0, max_chars } = {}) {
+// fetch_url with a date limit (k-0657, the blog workbench and its dated sub-agent): additive args `before` (only a page
+// that can be shown to have existed before that day) and `exclude` (addresses left out), as web_search takes them.
+// Without them nothing changes. A page is dated by the date it states (published), else an X post's `created`, else
+// the Internet Archive's first copy, the same way web_search's dated filter works. Refusals are errors marked
+// `refused` ('date' | 'excluded'), so a caller can tell them from a page that failed to load. A success gains
+// `date_check: { before, day, source }`. Known limit: a page dated before the day is still read as it is today.
+const FEED_RE = /\.(xml|rss|atom)$|\/(feed|rss|atom)(\.xml)?\/?$|\/feeds?\//i;
+const dayOfStamp = (s) => { const t = String(s || ''); if (/^\d{8}/.test(t)) return `${t.slice(0, 4)}-${t.slice(4, 6)}-${t.slice(6, 8)}`; const d = Date.parse(t); return Number.isNaN(d) ? null : new Date(d).toISOString().slice(0, 10); };
+const pathDepth = (u) => { try { return new URL(u).pathname.split('/').filter(Boolean).length; } catch { return 0; } };
+
+let plainFetch = (a) => fetchUrlPlain(a);
+let firstSeen = (u) => waybackFirstSeen(u);
+/** Tests only: replace the plain fetch and the Archive lookup behind the dated fetch_url. */
+export function __setDatedFetchDeps({ plain, first } = {}) { plainFetch = plain || ((a) => fetchUrlPlain(a)); firstSeen = first || ((u) => waybackFirstSeen(u)); }
+
+async function fetchUrl(args = {}) {
+  const { before, exclude } = args;
+  if (before == null && exclude == null) return plainFetch(args);
+  let day;
+  try { day = parseDay(before, 'before'); } catch (e) { return { error: e.message }; }
+  const ex = normalizeExclude(exclude);
+  const refuse = (error, why = 'date') => ({ error, refused: why });
+  if (args.url && ex.length && isExcluded(args.url, ex)) return refuse('That address is left out of this fetch.', 'excluded');
+  if (day && FEED_RE.test(String(args.url || '').split(/[?#]/)[0])) return refuse(`A feed lists pages newer than ${day}, so it can't be read as it was then.`);
+  const out = await plainFetch(args);
+  if (!out.result) return out;   // a page that failed to load is reported as it always was
+  const r = out.result;
+  if (r.url && ex.length && isExcluded(r.url, ex)) return refuse('That address leads to a page left out of this fetch.', 'excluded');
+  if (!day) return out;
+  if (r.url && FEED_RE.test(String(r.url).split(/[?#]/)[0])) return refuse(`That address leads to a feed, which lists pages newer than ${day}.`);
+  if (r.archived) {
+    const a = dayOfStamp(r.archive_date);
+    if (!a || a >= day) return refuse(`Only the Internet Archive's copy from ${a || 'an unknown day'} could be read, which isn't from before ${day}.`);
+  }
+  let checked = null;
+  if (r.published) checked = { day: r.published, source: 'page publish date' };
+  else if (r.created && dayOfStamp(r.created)) checked = { day: dayOfStamp(r.created), source: 'post date' };
+  else {
+    if (pathDepth(r.url || args.url) <= 1) return refuse(`A front or listing page with no date shows today's list, not what was there before ${day}.`);
+    const first = await firstSeen(r.url || args.url);
+    if (first === 'unavailable') return refuse("The page has no date and the Internet Archive couldn't be asked just now (it is rationed); try again in a few minutes.");
+    if (!first) return refuse(`The page has no date and no archived copy, so it can't be shown to have existed before ${day}.`);
+    checked = { day: first, source: 'first archived copy' };
+  }
+  if (checked.day >= day) return refuse(`${checked.source === 'first archived copy' ? 'First archived' : 'Published'} ${checked.day}, not before ${day}.`);
+  return { result: { ...r, date_check: { before: day, day: checked.day, source: checked.source } } };
+}
+
+async function fetchUrlPlain({ url, mode = 'text', render, offset = 0, max_chars } = {}) {
   if (!url) return { error: 'url is required' };
 
   // Paging args: offset (min 0), max_chars (min 1, hard cap 20000, default 8000).
@@ -546,7 +604,7 @@ async function convertCurrency({ amount = 1, from, to } = {}) {
 
 export const CAPABILITIES = {
   web_search: { description: 'Search the live web (SearXNG → Serper → Brave). Args: {query, limit?, recency?: day|week|month|year, before?: YYYY-MM-DD (only pages that existed before that day), after?: YYYY-MM-DD (only pages first seen on or after it), exclude?: [URL parts to leave out]}. A dated search returns a filter block saying how the dates were checked and what was left out.', args: { query: 'string', limit: 'number?', recency: 'day|week|month|year?', before: 'YYYY-MM-DD?', after: 'YYYY-MM-DD?', exclude: 'string[]?' }, handler: webSearch },
-  fetch_url: { description: 'Fetch a URL as readable text (article-quality extraction, SSRF-safe, reads PDFs (≤20MB) as text). Handles X/Twitter, YouTube, TikTok, (best-effort) Instagram, GitHub, Reddit and Hacker News via per-platform readers. JS-rendered SPAs are rendered automatically; pass render:true to force, render:false to disable. Long pages: re-fetch with offset to continue reading. Unreachable pages fall back to the Internet Archive when a snapshot exists. Args: {url, mode?: text|links|both, render?: boolean, offset?: number, max_chars?: number}. arXiv PDFs auto-redirect to the abstract.', args: { url: 'string', mode: 'text|links|both?', render: 'boolean?', offset: 'number?', max_chars: 'number?' }, handler: fetchUrl },
+  fetch_url: { description: 'Fetch a URL as readable text (article-quality extraction, SSRF-safe, reads PDFs (≤20MB) as text). Handles X/Twitter, YouTube, TikTok, (best-effort) Instagram, GitHub, Reddit and Hacker News via per-platform readers. JS-rendered SPAs are rendered automatically; pass render:true to force, render:false to disable. Long pages: re-fetch with offset to continue reading. Unreachable pages fall back to the Internet Archive when a snapshot exists. Args: {url, mode?: text|links|both, render?: boolean, offset?: number, max_chars?: number, before?: YYYY-MM-DD, exclude?: string[]}. arXiv PDFs auto-redirect to the abstract. With before: only a page shown to have existed before that day (its own date, else its first archived copy); refusals are errors marked refused.', args: { url: 'string', mode: 'text|links|both?', render: 'boolean?', offset: 'number?', max_chars: 'number?', before: 'YYYY-MM-DD?', exclude: 'string[]?' }, handler: fetchUrl },
   search_papers: { description: 'Search academic papers across HF, arXiv, and Semantic Scholar. Args: {query, source?: hf|arxiv|ss|all, limit?}.', args: { query: 'string', source: 'hf|arxiv|ss|all?', limit: 'number?' }, handler: searchPapers },
   search_models: { description: 'Search Hugging Face models. Args: {query, limit?}.', args: { query: 'string', limit: 'number?' }, handler: (a) => hfSearch('models', a) },
   search_datasets: { description: 'Search Hugging Face datasets. Args: {query, limit?}.', args: { query: 'string', limit: 'number?' }, handler: (a) => hfSearch('datasets', a) },

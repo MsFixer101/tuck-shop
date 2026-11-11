@@ -65,3 +65,5 @@ grok mcp add tuckshop node -- /path/to/tuck-shop/mcp.js
 
 ## Consumer contract
 The `fetch_url` result fields `content`, `readable`, `platform`, `url`, `chars`, `truncated` are frozen — consumers flatten on them. New fields are additive only.
+
+`published: 'YYYY-MM-DD'` (k-0657, 11 Nov 2026): the date a web page states about itself (meta tags, then JSON-LD), read the same way as web_search's dated filter. Present only when the page states one; pages without a date return exactly what they did before.
