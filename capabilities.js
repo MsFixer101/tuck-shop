@@ -9,7 +9,7 @@ import { platformFetch } from './lib/readers.js';
 import { TtlCache } from './lib/cache.js';
 import { execFile } from 'node:child_process';
 import { cognitiveCapabilities } from './cognitive.js';
-import { parseDay, serperTbs, braveFreshness, normalizeExclude, isExcluded, keepByDate } from './lib/search-dates.js';
+import { parseDay, serperTbs, braveFreshness, normalizeExclude, isExcluded, keepByDate, publishedDateFromHtml } from './lib/search-dates.js';
 
 // YouTube transcripts: pure-Node caption fetch is dead (YouTube returns 200/empty
 // to naive requests). The Python youtube-transcript-api keeps up with their
@@ -222,7 +222,16 @@ function buildPageMaterial(finalUrl, rawHtml, mode) {
     if (byline) material.byline = byline;
     material.meta = meta;
   }
+  // The date the page states about itself (meta tags, then JSON-LD), as web_search's dated filter reads it.
+  // Additive (k-0657): only present when the page states one.
+  const published = publishedDateFromHtml(rawHtml || '');
+  if (published) material.published = published;
   return material;
+}
+
+/** Tests only: what fetch_url returns for this HTML, without fetching it. */
+export function __pageResult(finalUrl, rawHtml, mode = 'text', off = 0, maxChars = 8000) {
+  return materialize(buildPageMaterial(finalUrl, rawHtml, mode), mode, off, maxChars);
 }
 
 // Pure function: turn cached material into the final paged result.
@@ -274,6 +283,7 @@ function materialize(material, mode, off, maxChars) {
       if (material.meta.site_name) out.site_name = material.meta.site_name;
     }
   }
+  if (material.published) out.published = material.published;
   if (material.rendered) out.rendered = true;
   if (material.render_attempted) out.render_attempted = true;
   if (material.note) out.note = material.note;
