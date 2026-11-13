@@ -10,6 +10,7 @@ import { TtlCache } from './lib/cache.js';
 import { execFile } from 'node:child_process';
 import { cognitiveCapabilities } from './cognitive.js';
 import { parseDay, serperTbs, braveFreshness, normalizeExclude, isExcluded, keepByDate, publishedDateFromHtml, waybackFirstSeen } from './lib/search-dates.js';
+import { getLocation } from './lib/location.js';
 
 // YouTube transcripts: pure-Node caption fetch is dead (YouTube returns 200/empty
 // to naive requests). The Python youtube-transcript-api keeps up with their
@@ -609,6 +610,9 @@ export const CAPABILITIES = {
   search_models: { description: 'Search Hugging Face models. Args: {query, limit?}.', args: { query: 'string', limit: 'number?' }, handler: (a) => hfSearch('models', a) },
   search_datasets: { description: 'Search Hugging Face datasets. Args: {query, limit?}.', args: { query: 'string', limit: 'number?' }, handler: (a) => hfSearch('datasets', a) },
   convert_currency: { description: 'Convert an amount between currencies at live rates. Args: {amount, from, to}.', args: { amount: 'number', from: 'string', to: 'string' }, handler: convertCurrency },
+  // k-0696 (her 13 Nov): the town the internet connection is registered to, from a local geo-IP database. Her answer
+  // shape is in the description so every caller's model sees it.
+  get_location: { description: "Roughly where the user is: the town their internet connection is registered to (local geo-IP database; approximate, usually their home). Use it for anything local (weather, opening hours, what's nearby) instead of asking where they are. Say where it shows and invite a correction, e.g. \"I've checked and it shows you're in <town>. Correct me if I'm wrong and I'll search again.\" Args: {}.", args: {}, handler: getLocation },
   // Cognitive tools bridged from Train Tracks (calculator, datetime, probability,
   // statistics, thesaurus, units). Empty {} if the TT package is unavailable.
   ...cognitiveCapabilities,
